@@ -115,6 +115,8 @@ class Trail(Generic[T]):
         watch_default: str | Sequence[str] | None = None,
         watchers: Mapping[str, Callable[[], Any]] | None = None,
         enabled: bool = True,
+        max_depth: int = 3,
+        max_items: int = 20,
         max_str: int = 300,
         redact: Callable[[str], str] | None = None,
         _branch: str | None = None,
@@ -131,6 +133,8 @@ class Trail(Generic[T]):
             else tuple(str(x) for x in watch_default)
         )
         self._watchers: dict[str, Callable[[], Any]] = dict(watchers or {})
+        self.max_depth = max_depth
+        self.max_items = max_items
         self.max_str = max_str
         self.redact = redact
         self._branch = _branch
@@ -144,7 +148,7 @@ class Trail(Generic[T]):
         self._entries: list[Entry] = []
         self._stages: list[StageSummary] = []
         self.input_summary: Any = (
-            take_snapshot(input_summary, max_str=max_str, redact=redact)
+            self._snap(input_summary)
             if self.enabled and input_summary is not None
             else None
         )
@@ -164,7 +168,13 @@ class Trail(Generic[T]):
         return frame.name if frame is not None else self._default_stage
 
     def _snap(self, value: Any) -> Any:
-        return take_snapshot(value, max_str=self.max_str, redact=self.redact)
+        return take_snapshot(
+            value,
+            max_depth=self.max_depth,
+            max_items=self.max_items,
+            max_str=self.max_str,
+            redact=self.redact,
+        )
 
     @contextmanager
     def activate(self) -> Iterator[Trail[T]]:
@@ -471,6 +481,8 @@ class Trail(Generic[T]):
             watch_default=self.watch_default,
             watchers=self._watchers if state is _SAME else None,
             enabled=self.enabled,
+            max_depth=self.max_depth,
+            max_items=self.max_items,
             max_str=self.max_str,
             redact=self.redact,
             _branch=name,
