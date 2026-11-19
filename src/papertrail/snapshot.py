@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import datetime
 import itertools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence, Sized
 from collections.abc import Set as AbstractSet
+from decimal import Decimal
 from enum import Enum
+from pathlib import PurePath
 from typing import Any
+from uuid import UUID
 
 REDACTED = "[REDACTED]"
 
@@ -81,6 +85,14 @@ def take_snapshot(
         return value if math.isfinite(value) else str(value)
     if isinstance(value, str):
         return _truncate_str(value, max_str, redact)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, datetime.timedelta):
+        return str(value)
+    if isinstance(value, (Decimal, UUID)):
+        return str(value)
+    if isinstance(value, PurePath):
+        return _truncate_str(str(value), max_str, redact)
     if isinstance(value, (bytes, bytearray, memoryview)):
         raw = bytes(value[: max(0, max_str) + 64]).decode("utf-8", errors="replace")
         total = len(value)
@@ -189,9 +201,17 @@ def take_snapshot(
 
         model_dump = getattr(value, "model_dump", None)
         if callable(model_dump):
+            dumped: Any = _MISSING
             try:
+                dumped = model_dump(mode="json")
+            except Exception:
+                try:
+                    dumped = model_dump()
+                except Exception:
+                    dumped = _MISSING
+            if dumped is not _MISSING:
                 return take_snapshot(
-                    model_dump(),
+                    dumped,
                     max_depth=max_depth,
                     max_items=max_items,
                     max_str=max_str,
@@ -199,8 +219,6 @@ def take_snapshot(
                     _depth=_depth,
                     _seen=seen,
                 )
-            except Exception:
-                pass
 
         if _is_plain_object_with_attrs(value):
             public_attrs = {k: v for k, v in vars(value).items() if not str(k).startswith("_")}
@@ -241,7 +259,23 @@ def write_field(state: Any, field: str, value: Any) -> None:
 
 def is_fast_immutable(value: Any) -> bool:
     """Return True if identity comparison (old is new) safely proves value did not change."""
-    if value is None or isinstance(value, (bool, int, float, str, bytes, Enum)):
+    if value is None or isinstance(
+        value,
+        (
+            bool,
+            int,
+            float,
+            str,
+            bytes,
+            Enum,
+            datetime.date,
+            datetime.time,
+            datetime.timedelta,
+            Decimal,
+            UUID,
+            PurePath,
+        ),
+    ):
         return True
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         params = getattr(type(value), "__dataclass_params__", None)
