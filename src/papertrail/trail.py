@@ -583,8 +583,12 @@ class Trail(Generic[T]):
     def to_json(self, *, indent: int | None = 2) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
 
-    def to_markdown(self, *, include_evidence: bool = True) -> str:
-        return format_markdown(self.to_dict(), include_evidence=include_evidence)
+    def to_markdown(self, *, include_evidence: bool = True, all_stages: bool = False) -> str:
+        return format_markdown(
+            self.to_dict(),
+            include_evidence=include_evidence,
+            all_stages=all_stages,
+        )
 
     def write_jsonl(self, path: str | Path) -> Path:
         """Append this trail as a single JSON line and return the resolved path."""

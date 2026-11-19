@@ -43,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
     show.add_argument("--index", type=int, default=-1, help="0-based or negative record index (default: -1, latest).")
     show.add_argument("--field", default=None, help="Only show entries touching a specific field/decision name.")
     show.add_argument("--decisions", action="store_true", help="Only show decisions and errors.")
+    show.add_argument(
+        "--all-stages",
+        action="store_true",
+        help="Include idle stages (0 changes/decisions/entries, ok, < 1 ms) in Markdown output.",
+    )
     show.add_argument("--json", dest="as_json", action="store_true", help="Print matching record as JSON.")
 
     args = parser.parse_args(argv)
@@ -84,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             include_evidence=True,
             field=args.field,
             decisions_only=args.decisions,
+            all_stages=args.all_stages,
         )
     )
     return 0

@@ -1,6 +1,6 @@
 [project]
 name = "papertrail"
-version = "0.2.1"
+version = "0.2.2"
 description = "Zero-dependency per-turn state and decision provenance ledger for Python pipelines."
 readme = "README.md"
 requires-python = ">=3.11"
