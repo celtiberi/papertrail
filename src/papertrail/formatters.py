@@ -1,0 +1,93 @@
+"""Human-readable Markdown formatting for Trail exports and JSONL debug artifacts."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+
+def _short_repr(value: Any, max_len: int = 120) -> str:
+    if isinstance(value, str):
+        rendered = repr(value)
+    else:
+        try:
+            rendered = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            rendered = repr(value)
+    if len(rendered) <= max_len:
+        return rendered
+    return rendered[: max_len - 3] + "..."
+
+
+def format_markdown(
+    data: dict[str, Any],
+    *,
+    include_evidence: bool = True,
+    field: str | None = None,
+    decisions_only: bool = False,
+) -> str:
+    """Format a Trail dictionary as a readable Markdown timeline."""
+    name = str(data.get("name") or "run")
+    total_ms = float(data.get("total_ms") or 0.0)
+    raw_entries = list(data.get("entries") or [])
+    stages = list(data.get("stages") or [])
+
+    filtered: list[dict[str, Any]] = []
+    for entry in raw_entries:
+        if field is not None and entry.get("field") != field:
+            continue
+        if decisions_only and entry.get("kind") not in ("decision", "error"):
+            continue
+        filtered.append(entry)
+
+    lines: list[str] = [f"### Papertrail: {name} ({len(filtered)} entries, {total_ms:.1f} ms)"]
+    input_summary = data.get("input_summary")
+    if input_summary is not None:
+        lines.append(f"**Input:** `{_short_repr(input_summary, max_len=200)}`")
+
+    if not filtered:
+        lines.append("")
+        lines.append("_No matching entries recorded._")
+    else:
+        lines.append("")
+        for entry in filtered:
+            seq = entry.get("seq", "?")
+            stage = entry.get("stage") or "root"
+            branch = entry.get("branch")
+            loc = f"{stage} | {branch}" if branch else stage
+            at_ms = float(entry.get("at_ms") or 0.0)
+            caller = entry.get("caller") or ""
+            caller_part = f" `{caller}`" if caller else ""
+            kind = entry.get("kind") or "note"
+            f_name = entry.get("field")
+
+            if kind in ("set", "change", "diff"):
+                headline = (
+                    f"**{kind}** `{f_name}`: `{_short_repr(entry.get('before'))}` -> "
+                    f"`{_short_repr(entry.get('after'))}`"
+                )
+            elif kind == "decision":
+                headline = f"**decision** `{f_name}` = `{_short_repr(entry.get('outcome'))}`"
+            elif kind == "error":
+                headline = f"**error** `{f_name}`: `{_short_repr(entry.get('reason'))}`"
+            else:
+                headline = f"**note**: {entry.get('reason') or ''}"
+
+            lines.append(f"{seq}. `[{loc}]` (+{at_ms:.1f} ms){caller_part} — {headline}")
+            if kind != "note" and entry.get("reason"):
+                lines.append(f"   why: {entry['reason']}")
+            if include_evidence and entry.get("evidence"):
+                lines.append(f"   evidence: `{json.dumps(entry['evidence'], ensure_ascii=False)}`")
+
+    if stages and field is None and not decisions_only:
+        lines.append("")
+        lines.append("| Stage | Branch | Status | Changes | Decisions | Duration |")
+        lines.append("|---|---|---|---|---|---|")
+        for st in stages:
+            lines.append(
+                f"| `{st.get('stage', '')}` | `{st.get('branch') or '-'}` | "
+                f"{st.get('status', 'ok')} | {st.get('changes', 0)} | "
+                f"{st.get('decisions', 0)} | {float(st.get('duration_ms') or 0.0):.1f} ms |"
+            )
+
+    return "\n".join(lines)
