@@ -9,6 +9,11 @@ dependencies = []
 [project.scripts]
 papertrail = "papertrail.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/celtiberi/papertrail"
+Repository = "https://github.com/celtiberi/papertrail"
+Issues = "https://github.com/celtiberi/papertrail/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
