@@ -36,12 +36,23 @@ def _flatten_dict_diff(before: dict[str, Any], after: dict[str, Any], prefix: st
     return parts
 
 
+def _is_idle_stage(st: dict[str, Any], active_stage_keys: set[tuple[Any, Any]]) -> bool:
+    return (
+        st.get("status", "ok") == "ok"
+        and int(st.get("changes") or 0) == 0
+        and int(st.get("decisions") or 0) == 0
+        and float(st.get("duration_ms") or 0.0) < 1.0
+        and (st.get("stage"), st.get("branch")) not in active_stage_keys
+    )
+
+
 def format_markdown(
     data: dict[str, Any],
     *,
     include_evidence: bool = True,
     field: str | None = None,
     decisions_only: bool = False,
+    all_stages: bool = False,
 ) -> str:
     """Format a Trail dictionary as a readable Markdown timeline."""
     name = str(data.get("name") or "run")
@@ -104,14 +115,30 @@ def format_markdown(
                 lines.append(f"   evidence: `{json.dumps(entry['evidence'], ensure_ascii=False)}`")
 
     if stages and field is None and not decisions_only:
-        lines.append("")
-        lines.append("| Stage | Branch | Status | Changes | Decisions | Duration |")
-        lines.append("|---|---|---|---|---|---|")
-        for st in stages:
+        if all_stages:
+            visible_stages = stages
+            omitted = 0
+        else:
+            active_stage_keys = {(e.get("stage"), e.get("branch")) for e in raw_entries}
+            visible_stages = [st for st in stages if not _is_idle_stage(st, active_stage_keys)]
+            omitted = len(stages) - len(visible_stages)
+
+        if visible_stages:
+            lines.append("")
+            lines.append("| Stage | Branch | Status | Changes | Decisions | Duration |")
+            lines.append("|---|---|---|---|---|---|")
+            for st in visible_stages:
+                lines.append(
+                    f"| `{st.get('stage', '')}` | `{st.get('branch') or '-'}` | "
+                    f"{st.get('status', 'ok')} | {st.get('changes', 0)} | "
+                    f"{st.get('decisions', 0)} | {float(st.get('duration_ms') or 0.0):.1f} ms |"
+                )
+        if omitted > 0:
+            if not visible_stages:
+                lines.append("")
             lines.append(
-                f"| `{st.get('stage', '')}` | `{st.get('branch') or '-'}` | "
-                f"{st.get('status', 'ok')} | {st.get('changes', 0)} | "
-                f"{st.get('decisions', 0)} | {float(st.get('duration_ms') or 0.0):.1f} ms |"
+                f"_({omitted} idle {'stage' if omitted == 1 else 'stages'} "
+                "< 1 ms omitted; pass --all-stages to show all)_"
             )
 
     return "\n".join(lines)

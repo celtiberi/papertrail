@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2 - 2026-11-19
+
+- Omit idle stages (`status == "ok"`, zero changes, zero decisions, zero recorded entries, `< 1 ms`) from Markdown stage tables by default to keep multi-stage timelines concise, with an omitted-count footer note.
+- Added `all_stages: bool = False` on `format_markdown(...)` / `Trail.to_markdown(...)` and `--all-stages` on `papertrail show` to display every stage when requested.
+
 ## 0.2.1 - 2026-11-19
 
 - Serialize `datetime.date`, `datetime.datetime`, `datetime.time`, `datetime.timedelta`, `Decimal`, `UUID`, and `Path`/`PurePath` cleanly in `take_snapshot()` instead of falling back to type placeholders (and mark them immutable in `is_fast_immutable()`), while preferring `model_dump(mode="json")` with fallback to `model_dump()`.

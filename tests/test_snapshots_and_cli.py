@@ -117,3 +117,70 @@ def test_jsonl_roundtrip_markdown_and_cli_flags(tmp_path: Path, capsys: object) 
     out_field = capsys.readouterr().out  # type: ignore[attr-defined]
     assert "routed to QA" in out_field
     assert "Here is the answer" not in out_field
+
+
+def test_markdown_and_cli_hide_idle_stages_by_default(tmp_path: Path, capsys: object) -> None:
+    from papertrail import format_markdown
+
+    record = {
+        "name": "multi-stage",
+        "total_ms": 5.4,
+        "entries": [
+            {"seq": 1, "at_ms": 0.2, "kind": "note", "stage": "noted_only", "caller": "", "reason": "kept"},
+            {
+                "seq": 2,
+                "at_ms": 1.0,
+                "kind": "set",
+                "stage": "mutated",
+                "caller": "",
+                "field": "x",
+                "before": 0,
+                "after": 1,
+            },
+        ],
+        "stages": [
+            {"stage": "idle_a", "branch": None, "status": "ok", "changes": 0, "decisions": 0, "duration_ms": 0.1},
+            {"stage": "idle_b", "branch": None, "status": "ok", "changes": 0, "decisions": 0, "duration_ms": 0.9},
+            {"stage": "slow_noop", "branch": None, "status": "ok", "changes": 0, "decisions": 0, "duration_ms": 1.0},
+            {"stage": "noted_only", "branch": None, "status": "ok", "changes": 0, "decisions": 0, "duration_ms": 0.2},
+            {"stage": "mutated", "branch": None, "status": "ok", "changes": 1, "decisions": 0, "duration_ms": 0.3},
+            {"stage": "errored", "branch": None, "status": "error", "changes": 0, "decisions": 0, "duration_ms": 0.1},
+            {"stage": "decided", "branch": None, "status": "ok", "changes": 0, "decisions": 1, "duration_ms": 0.1},
+        ],
+    }
+
+    md_default = format_markdown(record)
+    assert "`idle_a`" not in md_default
+    assert "`idle_b`" not in md_default
+    for kept in ("`slow_noop`", "`noted_only`", "`mutated`", "`errored`", "`decided`"):
+        assert kept in md_default
+    assert "_(2 idle stages < 1 ms omitted; pass --all-stages to show all)_" in md_default
+
+    md_all = format_markdown(record, all_stages=True)
+    assert "`idle_a`" in md_all
+    assert "`idle_b`" in md_all
+    assert "omitted" not in md_all
+
+    # Verify Trail.to_markdown(all_stages=...) and CLI --all-stages wiring.
+    trail = Trail({"x": 0}, name="trail-idle")
+    with trail.stage("idle_fast"):
+        pass
+    with trail.stage("mutated"):
+        trail.set("x", 1, reason="changed")
+    assert "`idle_fast`" not in trail.to_markdown()
+    assert "1 idle stage < 1 ms omitted" in trail.to_markdown()
+    assert "`idle_fast`" in trail.to_markdown(all_stages=True)
+
+    log_path = tmp_path / "idle.jsonl"
+    log_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    assert cli_main(["show", str(log_path)]) == 0
+    cli_default = capsys.readouterr().out  # type: ignore[attr-defined]
+    assert "`idle_a`" not in cli_default
+    assert "2 idle stages < 1 ms omitted" in cli_default
+
+    assert cli_main(["show", str(log_path), "--all-stages"]) == 0
+    cli_all = capsys.readouterr().out  # type: ignore[attr-defined]
+    assert "`idle_a`" in cli_all
+    assert "`idle_b`" in cli_all
+    assert "omitted" not in cli_all
