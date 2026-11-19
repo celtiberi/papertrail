@@ -19,6 +19,23 @@ def _short_repr(value: Any, max_len: int = 120) -> str:
     return rendered[: max_len - 3] + "..."
 
 
+def _flatten_dict_diff(before: dict[str, Any], after: dict[str, Any], prefix: str = "") -> list[str]:
+    parts: list[str] = []
+    for key in list(dict.fromkeys((*before.keys(), *after.keys()))):
+        full_key = f"{prefix}{key}"
+        b_has = key in before
+        a_has = key in after
+        b_val = before.get(key)
+        a_val = after.get(key)
+        if b_has and a_has and isinstance(b_val, dict) and isinstance(a_val, dict):
+            parts.extend(_flatten_dict_diff(b_val, a_val, f"{full_key}."))
+            continue
+        b_txt = _short_repr(b_val) if b_has else "<unset>"
+        a_txt = _short_repr(a_val) if a_has else "<unset>"
+        parts.append(f"{full_key}: {b_txt} -> {a_txt}")
+    return parts
+
+
 def format_markdown(
     data: dict[str, Any],
     *,
@@ -62,10 +79,17 @@ def format_markdown(
             f_name = entry.get("field")
 
             if kind in ("set", "change", "diff"):
-                headline = (
-                    f"**{kind}** `{f_name}`: `{_short_repr(entry.get('before'))}` -> "
-                    f"`{_short_repr(entry.get('after'))}`"
-                )
+                b_val = entry.get("before")
+                a_val = entry.get("after")
+                if kind == "diff" and isinstance(b_val, dict) and isinstance(a_val, dict):
+                    delta_parts = _flatten_dict_diff(b_val, a_val)
+                    delta_text = ", ".join(delta_parts) if delta_parts else "{}"
+                    headline = f"**diff** `{f_name}`: {delta_text}"
+                else:
+                    headline = (
+                        f"**{kind}** `{f_name}`: `{_short_repr(b_val)}` -> "
+                        f"`{_short_repr(a_val)}`"
+                    )
             elif kind == "decision":
                 headline = f"**decision** `{f_name}` = `{_short_repr(entry.get('outcome'))}`"
             elif kind == "error":

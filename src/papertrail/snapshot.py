@@ -239,6 +239,45 @@ def write_field(state: Any, field: str, value: Any) -> None:
     setattr(state, field, value)
 
 
+def is_fast_immutable(value: Any) -> bool:
+    """Return True if identity comparison (old is new) safely proves value did not change."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes, Enum)):
+        return True
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        params = getattr(type(value), "__dataclass_params__", None)
+        return bool(params and getattr(params, "frozen", False))
+    if isinstance(value, tuple) and len(value) <= 32:
+        return all(is_fast_immutable(item) for item in value)
+    return False
+
+
+def dict_delta(before: dict[str, Any], after: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Extract only added, removed, or modified keys between two snapshot dicts."""
+    before_out: dict[str, Any] = {}
+    after_out: dict[str, Any] = {}
+    for key in list(dict.fromkeys((*before.keys(), *after.keys()))):
+        in_b = key in before
+        in_a = key in after
+        if in_b and not in_a:
+            before_out[key] = before[key]
+        elif in_a and not in_b:
+            after_out[key] = after[key]
+        else:
+            b_val = before[key]
+            a_val = after[key]
+            if b_val == a_val:
+                continue
+            if isinstance(b_val, dict) and isinstance(a_val, dict):
+                sub_b, sub_a = dict_delta(b_val, a_val)
+                if sub_b or sub_a:
+                    before_out[key] = sub_b
+                    after_out[key] = sub_a
+            else:
+                before_out[key] = b_val
+                after_out[key] = a_val
+    return before_out, after_out
+
+
 def list_watch_fields(
     state: Any,
     watch: str | Sequence[str] | None,

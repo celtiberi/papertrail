@@ -7,21 +7,31 @@ import json
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from .formatters import format_markdown
-from .snapshot import list_watch_fields, read_field, take_snapshot, write_field
+from .snapshot import (
+    dict_delta,
+    is_fast_immutable,
+    list_watch_fields,
+    read_field,
+    take_snapshot,
+    write_field,
+)
 
 T = TypeVar("T")
 
 _PACKAGE_DIR = str(Path(__file__).resolve().parent)
 _CONTEXTLIB_FILE = str(Path(contextlib.__file__).resolve())
 _SAME = object()
+_UNSET = object()
+
+_ACTIVE_TRAIL: ContextVar[Trail[Any] | None] = ContextVar("papertrail_active_trail", default=None)
 
 
 def _capture_caller(depth: int = 1) -> str:
@@ -86,6 +96,12 @@ class _StageFrame:
     decisions: int = 0
 
 
+def _capture_baseline_entry(raw_val: Any, snap_fn: Callable[[Any], Any]) -> tuple[bool, Any, Any]:
+    if is_fast_immutable(raw_val):
+        return True, raw_val, None
+    return False, None, snap_fn(raw_val)
+
+
 class Trail(Generic[T]):
     """Lightweight per-turn provenance ledger wrapping a pipeline state object."""
 
@@ -96,6 +112,9 @@ class Trail(Generic[T]):
         name: str = "",
         input_summary: Any = None,
         exclude: Sequence[str] = (),
+        watch_default: str | Sequence[str] | None = None,
+        watchers: Mapping[str, Callable[[], Any]] | None = None,
+        enabled: bool = True,
         max_str: int = 300,
         redact: Callable[[str], str] | None = None,
         _branch: str | None = None,
@@ -104,7 +123,14 @@ class Trail(Generic[T]):
     ) -> None:
         self.state: T = state
         self.name = name
+        self.enabled = bool(enabled)
         self.exclude: tuple[str, ...] = tuple(str(x) for x in exclude)
+        self.watch_default: str | tuple[str, ...] | None = (
+            watch_default
+            if watch_default is None or isinstance(watch_default, str)
+            else tuple(str(x) for x in watch_default)
+        )
+        self._watchers: dict[str, Callable[[], Any]] = dict(watchers or {})
         self.max_str = max_str
         self.redact = redact
         self._branch = _branch
@@ -119,7 +145,7 @@ class Trail(Generic[T]):
         self._stages: list[StageSummary] = []
         self.input_summary: Any = (
             take_snapshot(input_summary, max_str=max_str, redact=redact)
-            if input_summary is not None
+            if self.enabled and input_summary is not None
             else None
         )
 
@@ -132,11 +158,25 @@ class Trail(Generic[T]):
 
     @property
     def current_stage(self) -> str:
+        if not self.enabled:
+            return self._default_stage
         frame = self._active_frame()
         return frame.name if frame is not None else self._default_stage
 
     def _snap(self, value: Any) -> Any:
         return take_snapshot(value, max_str=self.max_str, redact=self.redact)
+
+    @contextmanager
+    def activate(self) -> Iterator[Trail[T]]:
+        """Bind this trail as the active ambient trail in the current ContextVar scope."""
+        if not self.enabled:
+            yield self
+            return
+        token = _ACTIVE_TRAIL.set(self)
+        try:
+            yield self
+        finally:
+            _ACTIVE_TRAIL.reset(token)
 
     def _append_entry(
         self,
@@ -185,8 +225,12 @@ class Trail(Generic[T]):
         reason: str = "",
         evidence: dict[str, Any] | None = None,
         stage: str | None = None,
-    ) -> Entry:
+    ) -> Entry | None:
         """Mutate state.<field_name> (or state[field_name]) and record its before/after snapshot."""
+        if not self.enabled:
+            write_field(self.state, field_name, value)
+            return None
+
         old_val = read_field(self.state, field_name)
         write_field(self.state, field_name, value)
         entry = self._append_entry(
@@ -214,8 +258,11 @@ class Trail(Generic[T]):
         reason: str = "",
         evidence: dict[str, Any] | None = None,
         stage: str | None = None,
-    ) -> Entry:
+    ) -> Entry | None:
         """Record an explicit change without mutating (ideal for frozen dataclasses/signals)."""
+        if not self.enabled:
+            return None
+
         entry = self._append_entry(
             kind="change",
             stage=stage,
@@ -240,8 +287,11 @@ class Trail(Generic[T]):
         reason: str = "",
         evidence: dict[str, Any] | None = None,
         stage: str | None = None,
-    ) -> Entry:
+    ) -> Entry | None:
         """Record a branch, gate, threshold, or skip decision with its outcome and evidence."""
+        if not self.enabled:
+            return None
+
         entry = self._append_entry(
             kind="decision",
             stage=stage,
@@ -262,8 +312,11 @@ class Trail(Generic[T]):
         *,
         evidence: dict[str, Any] | None = None,
         stage: str | None = None,
-    ) -> Entry:
+    ) -> Entry | None:
         """Record a free-form provenance observation attached to the current stage."""
+        if not self.enabled:
+            return None
+
         return self._append_entry(
             kind="note",
             stage=stage,
@@ -272,18 +325,77 @@ class Trail(Generic[T]):
             evidence=evidence,
         )
 
+    def _emit_diff_if_changed(
+        self,
+        *,
+        target_name: str,
+        stage_name: str,
+        caller: str,
+        baseline: tuple[bool, Any, Any],
+        after_raw: Any,
+        frame: _StageFrame,
+    ) -> None:
+        was_fast, before_raw, before_snap = baseline
+        if was_fast and after_raw is before_raw:
+            return
+        before_val = self._snap(before_raw) if was_fast else before_snap
+        after_val = self._snap(after_raw)
+        if before_val == after_val:
+            return
+
+        if isinstance(before_val, dict) and isinstance(after_val, dict):
+            before_out, after_out = dict_delta(before_val, after_val)
+            if not before_out and not after_out:
+                return
+        else:
+            before_out, after_out = before_val, after_val
+
+        self._append_entry(
+            kind="diff",
+            stage=stage_name,
+            caller=caller,
+            field_name=target_name,
+            before=before_out,
+            after=after_out,
+        )
+        frame.changes += 1
+
     @contextmanager
     def stage(
         self,
         name: str,
         *,
-        watch: str | Sequence[str] | None = None,
+        watch: str | Sequence[str] | Literal[False] | None | object = _UNSET,
+        watchers: Mapping[str, Callable[[], Any]] | None = None,
         exclude: Sequence[str] = (),
     ) -> Iterator[None]:
-        """Track entry/exit timing for a stage and optionally diff direct mutations on watched fields."""
+        """Track timing for a stage and optionally diff state fields and external watchers."""
+        if not self.enabled:
+            yield
+            return
+
         skip = tuple(dict.fromkeys((*self.exclude, *exclude)))
-        watch_fields = list_watch_fields(self.state, watch, skip)
-        baseline = {f: self._snap(read_field(self.state, f)) for f in watch_fields}
+        skip_set = frozenset(skip)
+        if watch is False:
+            watch_fields: list[str] = []
+            merged_watchers: dict[str, Callable[[], Any]] = {}
+        else:
+            resolved_watch = self.watch_default if watch is _UNSET else watch
+            watch_fields = list_watch_fields(self.state, resolved_watch, skip)  # type: ignore[arg-type]
+            merged_watchers = {
+                k: fn
+                for k, fn in {**self._watchers, **(watchers or {})}.items()
+                if k not in skip_set
+            }
+
+        field_baseline = {
+            f: _capture_baseline_entry(read_field(self.state, f), self._snap)
+            for f in watch_fields
+        }
+        watcher_baseline = {
+            w_name: _capture_baseline_entry(w_fn(), self._snap)
+            for w_name, w_fn in merged_watchers.items()
+        }
 
         frame = _StageFrame(name=name)
         stack = self._stage_var.get()
@@ -304,18 +416,26 @@ class Trail(Generic[T]):
             for field_name in watch_fields:
                 if field_name in frame.explicit_fields:
                     continue
-                after_snap = self._snap(read_field(self.state, field_name))
-                before_snap = baseline[field_name]
-                if before_snap != after_snap:
-                    self._append_entry(
-                        kind="diff",
-                        stage=name,
-                        caller=caller,
-                        field_name=field_name,
-                        before=before_snap,
-                        after=after_snap,
-                    )
-                    frame.changes += 1
+                self._emit_diff_if_changed(
+                    target_name=field_name,
+                    stage_name=name,
+                    caller=caller,
+                    baseline=field_baseline[field_name],
+                    after_raw=read_field(self.state, field_name),
+                    frame=frame,
+                )
+
+            for w_name, w_fn in merged_watchers.items():
+                if w_name in frame.explicit_fields:
+                    continue
+                self._emit_diff_if_changed(
+                    target_name=w_name,
+                    stage_name=name,
+                    caller=caller,
+                    baseline=watcher_baseline[w_name],
+                    after_raw=w_fn(),
+                    frame=frame,
+                )
 
             if caught is not None:
                 self._append_entry(
@@ -348,6 +468,9 @@ class Trail(Generic[T]):
             child_state,
             name=self.name,
             exclude=self.exclude,
+            watch_default=self.watch_default,
+            watchers=self._watchers if state is _SAME else None,
+            enabled=self.enabled,
             max_str=self.max_str,
             redact=self.redact,
             _branch=name,
@@ -357,6 +480,8 @@ class Trail(Generic[T]):
 
     def merge(self, child: Trail[Any]) -> None:
         """Merge entries and stage summaries from a child branch with contiguous parent sequences."""
+        if not self.enabled or not child.enabled:
+            return
         with child._lock:
             child_entries = list(child._entries)
             child_stages = list(child._stages)
@@ -382,6 +507,17 @@ class Trail(Generic[T]):
     def stages(self) -> list[StageSummary]:
         with self._lock:
             return list(self._stages)
+
+    def stage_timings(self) -> dict[str, float]:
+        """Return summed wall-clock duration in milliseconds per stage (keyed 'branch:stage' when branched)."""
+        if not self.enabled:
+            return {}
+        timings: dict[str, float] = {}
+        with self._lock:
+            for st in self._stages:
+                key = f"{st.branch}:{st.stage}" if st.branch and st.branch != st.stage else st.stage
+                timings[key] = round(timings.get(key, 0.0) + st.duration_ms, 3)
+        return timings
 
     def for_field(self, field_name: str) -> list[Entry]:
         with self._lock:
@@ -413,7 +549,7 @@ class Trail(Generic[T]):
             stages = [s.to_dict() for s in self._stages]
         return {
             "name": self.name,
-            "total_ms": self._elapsed_ms(),
+            "total_ms": self._elapsed_ms() if self.enabled else 0.0,
             **out,
             "stages": stages,
         }
@@ -425,7 +561,7 @@ class Trail(Generic[T]):
             summary = self._build_summary_locked()
         return {
             "name": self.name,
-            "total_ms": self._elapsed_ms(),
+            "total_ms": self._elapsed_ms() if self.enabled else 0.0,
             "input_summary": self.input_summary,
             "summary": summary,
             "entries": entries,
@@ -446,3 +582,75 @@ class Trail(Generic[T]):
         with target.open("a", encoding="utf-8") as handle:
             handle.write(line)
         return target
+
+
+class NullTrail(Trail[T]):
+    """Zero-overhead disabled trail suitable as a drop-in default when tracing is off."""
+
+    def __init__(self, state: T = None, **kwargs: Any) -> None:  # type: ignore[assignment]
+        kwargs["enabled"] = False
+        super().__init__(state, **kwargs)
+
+
+def current_trail() -> Trail[Any] | None:
+    """Return the active Trail bound in the current ContextVar scope, or None."""
+    return _ACTIVE_TRAIL.get()
+
+
+def set(  # noqa: A001
+    field_name: str,
+    value: Any,
+    *,
+    reason: str = "",
+    evidence: dict[str, Any] | None = None,
+    stage: str | None = None,
+) -> Entry | None:
+    """Mutate and record on the active Trail when set; no-op returning None otherwise."""
+    active = _ACTIVE_TRAIL.get()
+    if active is None:
+        return None
+    return active.set(field_name, value, reason=reason, evidence=evidence, stage=stage)
+
+
+def record_change(
+    field_name: str,
+    before: Any,
+    after: Any,
+    *,
+    reason: str = "",
+    evidence: dict[str, Any] | None = None,
+    stage: str | None = None,
+) -> Entry | None:
+    """Record an explicit change on the active Trail when set; no-op returning None otherwise."""
+    active = _ACTIVE_TRAIL.get()
+    if active is None or not active.enabled:
+        return None
+    return active.record_change(field_name, before, after, reason=reason, evidence=evidence, stage=stage)
+
+
+def decide(
+    name: str,
+    *,
+    outcome: Any,
+    reason: str = "",
+    evidence: dict[str, Any] | None = None,
+    stage: str | None = None,
+) -> Entry | None:
+    """Record a decision on the active Trail when set; no-op returning None otherwise."""
+    active = _ACTIVE_TRAIL.get()
+    if active is None or not active.enabled:
+        return None
+    return active.decide(name, outcome=outcome, reason=reason, evidence=evidence, stage=stage)
+
+
+def note(
+    reason: str,
+    *,
+    evidence: dict[str, Any] | None = None,
+    stage: str | None = None,
+) -> Entry | None:
+    """Record a note on the active Trail when set; no-op returning None otherwise."""
+    active = _ACTIVE_TRAIL.get()
+    if active is None or not active.enabled:
+        return None
+    return active.note(reason, evidence=evidence, stage=stage)
